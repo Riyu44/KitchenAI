@@ -1,0 +1,8 @@
+venv/
+.env
+__pycache__/
+*.pyc
+*.pkl
+*.npy
+models/weights/
+test_curl.sh
