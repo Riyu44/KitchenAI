@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from supabase import create_client
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+from models.fridge_scanner import scan_image_bytes, get_scanner
 
 load_dotenv()
 
@@ -52,6 +53,12 @@ async def lifespan(app: FastAPI):
     except FileNotFoundError:
         print("⚠️  Model weights not found. Run data/build_embeddings.py first.")
         print("    Recommendation endpoints will return 503 until weights exist.")
+    #adding scanner at startup
+    try:
+        get_scanner()   # preload fridge scanner at startup
+        print("✅ Fridge scanner ready.")
+    except FileNotFoundError:
+        print("⚠️  Fridge scanner weights not found. /scan will return 503.")
     yield
     print("KitchenAI API shutting down.")
 
@@ -649,6 +656,110 @@ def get_grocery_list(user_id: str, recipe_id: str, num_people: int = 2):
         "message":       f"You have {len(have)}/{len(ingredients)} ingredients. "
                          f"Need to order {len(need)} items."
     }
+
+
+# ── Fridge scanner endpoint ─────────────────────────────────────────────────────
+
+
+from fastapi import UploadFile, File
+import base64
+from io import BytesIO
+from PIL import Image as PILImage
+ 
+@app.post("/scan")
+async def scan_fridge(
+    file:    UploadFile = File(...),
+    user_id: str        = None,
+):
+    """
+    Fridge photo scanner endpoint.
+ 
+    Upload a photo of your fridge or vegetables →
+    returns list of detected ingredients.
+ 
+    Optionally pass user_id to auto-add detected items to inventory.
+ 
+    Pipeline:
+      YOLO detects items → EfficientNet classifies → CLIP handles unknowns
+ 
+    Example (curl):
+      curl -X POST http://localhost:8000/scan \\
+        -F "file=@fridge.jpg" \\
+        -F "user_id=YOUR_USER_ID"
+    """
+    # Validate file type
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected an image file, got {file.content_type}"
+        )
+ 
+    # Read image bytes
+    image_bytes = await file.read()
+    if len(image_bytes) > 20 * 1024 * 1024:  # 20MB limit
+        raise HTTPException(status_code=400, detail="Image too large. Max 20MB.")
+ 
+    # Run scan
+    try:
+        result = scan_image_bytes(image_bytes)
+    except FileNotFoundError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=str(e) + " Train the model on Kaggle first."
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+ 
+    # Auto-add to inventory if user_id provided
+    inventory_added = []
+    if user_id and result.get("detected_items"):
+        for item in result["detected_items"]:
+            if item["ingredient"] == "unknown item":
+                continue
+            try:
+                supabase.table("inventory").upsert({
+                    "user_id":         user_id,
+                    "ingredient_name": item["ingredient"],
+                    "quantity":        float(item["suggested_qty"]),
+                    "unit":            item["suggested_unit"],
+                    "source":          "fridge_scan",
+                    "last_updated":    "now()",
+                }, on_conflict="user_id,ingredient_name").execute()
+                inventory_added.append(item["ingredient"])
+            except Exception as e:
+                # Don't fail the whole request if one item fails to save
+                logger.warning(f"Could not save {item['ingredient']} to inventory: {e}")
+ 
+    # Build annotated image as base64 for the app to display
+    annotated_b64 = None
+    try:
+        pil_image = PILImage.open(BytesIO(image_bytes))
+        from models.fridge_scanner import get_scanner
+        scanner   = get_scanner()
+        scan_full = scanner.scan(pil_image)
+        annotated = scan_full.get("annotated_image")
+        if annotated:
+            buf = BytesIO()
+            annotated.save(buf, format="JPEG", quality=85)
+            annotated_b64 = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass   # annotated image is optional — don't fail if it errors
+ 
+    return {
+        "detected_items":    result["detected_items"],
+        "item_count":        result["item_count"],
+        "scan_time_sec":     result["scan_time_sec"],
+        "stats":             result["stats"],
+        "inventory_added":   inventory_added,
+        "annotated_image":   annotated_b64,   # base64 JPEG, null if failed
+        "message": (
+            f"Detected {result['item_count']} ingredients. "
+            + (f"Added {len(inventory_added)} items to inventory." if inventory_added else
+               "Pass user_id to auto-update your inventory.")
+        )
+    }
+
+
 
 
 # ── Dev utilities ─────────────────────────────────────────────────────────────
